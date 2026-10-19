@@ -2,8 +2,10 @@ import csv
 import io
 import re
 import uuid
+import time
+import threading
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Callable
 
 import gspread
 import pandas as pd
@@ -14,7 +16,7 @@ from gspread.exceptions import APIError, SpreadsheetNotFound, WorksheetNotFound
 # =========================
 # Google Sheets 설정: 여기에 실제 스프레드시트 URL을 입력하세요.
 # =========================
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1XhgaK6-gdIjHQxAlaWCDjlj2NWOHcyWkmJsphRlzKl0/edit?pli=1&gid=0#gid=0"
+SHEET_URL = "https://docs.google.com/spreadsheets/d/여기에_시트_ID/edit"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -53,6 +55,9 @@ LOAN_STATES = ["대여 중", "부분 반납", "반납 완료", "연체", "분실
 st.set_page_config(page_title="기술실 기자재 관리", page_icon="🧰", layout="wide")
 st.title("🧰 기술실 기자재 관리")
 st.caption("기자재 · 대여/반납 · 소모품 · 변경 이력")
+
+# 한 프로세스 안에서 Google Sheets 호출을 직렬화해 같은 앱의 요청 충돌을 줄입니다.
+SHEETS_LOCK = threading.RLock()
 
 def now_text() -> str:
     return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
@@ -101,55 +106,107 @@ def get_spreadsheet():
     client = get_client()
     return client.open_by_url(SHEET_URL)
 
+def api_retry(func: Callable, *args, **kwargs):
+    """일시적인 Google API 제한/서버 오류에만 지수형 대기를 적용합니다."""
+    delays = (0.6, 1.2, 2.4)
+    for attempt in range(len(delays) + 1):
+        try:
+            return func(*args, **kwargs)
+        except APIError as exc:
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+            # 권한/잘못된 요청은 재시도해도 해결되지 않습니다.
+            if status not in (429, 500, 502, 503, 504) or attempt >= len(delays):
+                raise
+            time.sleep(delays[attempt])
+
+@st.cache_resource(show_spinner=False)
+def worksheet_cache():
+    # Streamlit rerun마다 worksheet를 다시 조회하고 헤더를 검사하는 API 호출을 줄입니다.
+    return {}
+
 def get_worksheet(spreadsheet, name: str):
-    try:
-        ws = spreadsheet.worksheet(name)
-    except WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=name, rows=1000, cols=max(20, len(SHEETS[name])))
-    expected = SHEETS[name]
-    existing = ws.row_values(1)
-    if not existing:
-        ws.update(range_name="A1", values=[expected])
-    else:
-        # 기존 헤더와 데이터는 보존하고, 빠진 컬럼은 오른쪽에 추가한다.
-        missing = [col for col in expected if col not in existing]
-        if missing:
-            ws.update_cell(1, len(existing) + 1, existing[-1] if existing else expected[0]) if False else None
-            ws.update(range_name=f"{gspread.utils.rowcol_to_a1(1, len(existing)+1)}", values=[missing], value_input_option="USER_ENTERED")
-    return ws
+    with SHEETS_LOCK:
+        cache = worksheet_cache()
+        if name in cache:
+            return cache[name]
+        try:
+            ws = api_retry(spreadsheet.worksheet, name)
+        except WorksheetNotFound:
+            ws = api_retry(spreadsheet.add_worksheet, title=name, rows=1000, cols=max(20, len(SHEETS[name])))
+        expected = SHEETS[name]
+        existing = api_retry(ws.row_values, 1)
+        if not existing:
+            api_retry(ws.update, range_name="A1", values=[expected])
+        else:
+            # 기존 헤더와 데이터는 보존하고, 빠진 컬럼은 오른쪽에 추가합니다.
+            missing = [col for col in expected if col not in existing]
+            if missing:
+                start_col = len(existing) + 1
+                end_col = start_col + len(missing) - 1
+                start_a1 = gspread.utils.rowcol_to_a1(1, start_col)
+                end_a1 = gspread.utils.rowcol_to_a1(1, end_col)
+                api_retry(ws.update, range_name=f"{start_a1}:{end_a1}", values=[missing], value_input_option="USER_ENTERED")
+        cache[name] = ws
+        return ws
 
 def read_sheet(name: str) -> pd.DataFrame:
-    ss = get_spreadsheet()
-    ws = get_worksheet(ss, name)
-    records = ws.get_all_records()
-    df = pd.DataFrame(records)
-    for col in SHEETS[name]:
-        if col not in df.columns:
-            df[col] = ""
-    return df[SHEETS[name]]
+    with SHEETS_LOCK:
+        ws = get_worksheet(get_spreadsheet(), name)
+        records = api_retry(ws.get_all_records)
+        df = pd.DataFrame(records)
+        for col in SHEETS[name]:
+            if col not in df.columns:
+                df[col] = ""
+        return df[SHEETS[name]]
+
+def report_write_api_error(exc: APIError):
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status == 429:
+        st.error("Google Sheets 요청 한도를 초과했습니다. 잠시 기다린 뒤 다시 시도해 주세요.")
+    elif status in (500, 502, 503, 504):
+        st.error("Google Sheets 서버가 일시적으로 응답하지 않습니다. 잠시 후 다시 시도해 주세요.")
+    else:
+        st.error("Google Sheets 저장 요청이 실패했습니다. 권한과 API 설정을 확인해 주세요.")
+    with st.expander("기술 정보"):
+        st.code(str(exc))
+    st.stop()
 
 def append_record(name: str, record: dict):
-    ss = get_spreadsheet()
-    ws = get_worksheet(ss, name)
-    headers = ws.row_values(1)
-    row = [record.get(h, "") for h in headers]
-    ws.append_row(row, value_input_option="USER_ENTERED")
-    st.cache_data.clear()
+    # append는 응답이 끊긴 경우 중복 기록 가능성이 있어 자동 재시도하지 않습니다.
+    try:
+        with SHEETS_LOCK:
+            ws = get_worksheet(get_spreadsheet(), name)
+            headers = api_retry(ws.row_values, 1)
+            row = [record.get(h, "") for h in headers]
+            ws.append_row(row, value_input_option="USER_ENTERED")
+        st.cache_data.clear()
+    except APIError as exc:
+        report_write_api_error(exc)
 
 def update_record(name: str, key_col: str, key_value: str, changes: dict):
-    ss = get_spreadsheet()
-    ws = get_worksheet(ss, name)
-    headers = ws.row_values(1)
-    if key_col not in headers:
-        raise ValueError(f"{name} 시트에 '{key_col}' 컬럼이 없습니다.")
-    key_idx = headers.index(key_col) + 1
-    cell = ws.find(str(key_value), in_column=key_idx)
-    if not cell:
-        raise ValueError("수정할 기록을 찾을 수 없습니다. 새로고침 후 다시 시도해 주세요.")
-    for col, value in changes.items():
-        if col in headers:
-            ws.update_cell(cell.row, headers.index(col) + 1, value)
-    st.cache_data.clear()
+    try:
+        with SHEETS_LOCK:
+            ws = get_worksheet(get_spreadsheet(), name)
+            headers = api_retry(ws.row_values, 1)
+            if key_col not in headers:
+                raise ValueError(f"{name} 시트에 '{key_col}' 컬럼이 없습니다.")
+            key_idx = headers.index(key_col) + 1
+            cell = api_retry(ws.find, str(key_value), in_column=key_idx)
+            if not cell:
+                raise ValueError("수정할 기록을 찾을 수 없습니다. 새로고침 후 다시 시도해 주세요.")
+            updates = []
+            for col, value in changes.items():
+                if col in headers:
+                    col_idx = headers.index(col) + 1
+                    a1 = gspread.utils.rowcol_to_a1(cell.row, col_idx)
+                    updates.append({"range": a1, "values": [[value]]})
+            if updates:
+                api_retry(ws.batch_update, updates, value_input_option="USER_ENTERED")
+        st.cache_data.clear()
+    except APIError as exc:
+        report_write_api_error(exc)
 
 def log_change(action: str, target_id: str, target_name: str, detail: str, actor: str):
     append_record("변경이력", {
@@ -197,10 +254,6 @@ def get_open_loans(loans: pd.DataFrame) -> pd.DataFrame:
 
 try:
     initialize()
-    items = cached_read("기자재목록")
-    loans = cached_read("대여반납")
-    consumables = cached_read("소모품이력")
-    history = cached_read("변경이력")
 except ValueError as e:
     st.error(str(e))
     st.info("1) app.py의 SHEET_URL을 수정하고 2) Streamlit Secrets에 서비스 계정 정보를 설정하세요.")
@@ -230,11 +283,30 @@ with st.sidebar:
     if st.button("데이터 새로고침", use_container_width=True):
         refresh()
 
-# Load fresh data for every page render.
-items = cached_read("기자재목록")
-loans = cached_read("대여반납")
-consumables = cached_read("소모품이력")
-history = cached_read("변경이력")
+# 페이지 렌더링마다 한 번만 읽습니다. 동시 호출은 잠금으로 직렬화합니다.
+try:
+    with st.spinner("Google Sheets에서 데이터를 불러오는 중입니다..."):
+        items = cached_read("기자재목록")
+        loans = cached_read("대여반납")
+        consumables = cached_read("소모품이력")
+        history = cached_read("변경이력")
+except APIError as e:
+    response = getattr(e, "response", None)
+    status = getattr(response, "status_code", None)
+    if status == 429:
+        st.error("Google Sheets 요청 한도를 초과했습니다. 잠시 기다린 뒤 '데이터 새로고침'을 눌러 주세요.")
+    elif status in (500, 502, 503, 504):
+        st.error("Google Sheets 서버가 일시적으로 응답하지 않습니다. 잠시 후 다시 시도해 주세요.")
+    else:
+        st.error("Google Sheets API 요청이 실패했습니다. 아래 기술 정보를 확인해 주세요.")
+    with st.expander("기술 정보"):
+        st.code(str(e))
+    st.stop()
+except Exception as e:
+    st.error("Google Sheets에서 데이터를 불러오지 못했습니다. 연결 설정과 시트 권한을 확인해 주세요.")
+    with st.expander("기술 정보"):
+        st.code(f"{type(e).__name__}: {e}")
+    st.stop()
 
 # Normalize numbers and dates
 for col in ["보유수량", "대여가능수량", "최소재고수량", "구입가격"]:
