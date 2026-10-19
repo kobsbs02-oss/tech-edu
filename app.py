@@ -14,7 +14,7 @@ from gspread.exceptions import APIError, SpreadsheetNotFound, WorksheetNotFound
 # =========================
 # Google Sheets 설정: 여기에 실제 스프레드시트 URL을 입력하세요.
 # =========================
-SHEET_URL = "https://docs.google.com/spreadsheets/d/여기에_시트_ID/edit"
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1XhgaK6-gdIjHQxAlaWCDjlj2NWOHcyWkmJsphRlzKl0/edit?pli=1&gid=0#gid=0"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
